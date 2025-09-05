@@ -1,113 +1,117 @@
-import os, json, base64, datetime, sys
+import os, json, base64, platform, uuid, sys
+from datetime import datetime
 from typing import Tuple, Dict, Any
 
-from nacl.signing import VerifyKey
-from nacl.exceptions import BadSignatureError
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
-# === 공개키(Base64) ===
-PUBLIC_KEY_B64 = "REPLACE_ME_BASE64_PUBLIC_KEY"
+# 앱 디렉터리 및 기본 경로
+USER_HOME = os.path.expanduser("~")
+APP_DIR = os.path.join(os.getenv("APPDATA") or USER_HOME, "CommunityCrawler")
+LICENSE_PATH = os.path.join(APP_DIR, "license.lic")
+EXE_DIR = os.path.dirname(os.path.abspath(
+    sys.executable if getattr(sys, "frozen", False) else __file__
+))
+PORTABLE_LICENSE = os.path.join(EXE_DIR, "license.lic")
 
-ENV_LICENSE_VAR = "APP_LICENSE"            # 토큰 직접 전달
-ENV_LICENSE_FILE_VAR = "APP_LICENSE_FILE"   # 토큰 파일 경로
-DEFAULT_FILENAME = "license.dat"
-VENDOR_DIRNAME = "OneInsight"
-APP_DIRNAME = "UnifiedCrawler"
-
-
-def _b64url_decode(s: str) -> bytes:
-    s = s.replace('-', '+').replace('_', '/')
-    pad = 4 - (len(s) % 4)
-    if pad and pad < 4:
-        s += '=' * pad
-    return base64.b64decode(s)
-
-
-def _b64url_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode().rstrip('=')
-
-
-def _parse_license(license_str: str) -> Tuple[Dict[str, Any], bytes]:
-    parts = license_str.strip().split('.')
-    if len(parts) != 2:
-        raise ValueError("잘못된 라이선스 형식")
-    payload_b = _b64url_decode(parts[0])
-    sig_b = _b64url_decode(parts[1])
-    payload = json.loads(payload_b.decode('utf-8'))
-    return payload, sig_b
+# ====== 공개키를 배포 시 교체하세요 ======
+PUBLIC_PEM = b"""-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArwh9qGLUP3alVE/keAHz
+dV53lBIEVpzzuvTpi/EPXqufIXdjfGupZbpF8M7yUGtdsD8WGpW27BKuR4FQQmPO
+SNp6lIPwKlTvn46Y3R/nHFE9s0WazUyWIa7mkA0DbMhTihP6x7Lq2Y0dmEZUTJm0
+mKEzG+YF6RwOEmctHG05YqyK7xZEzSNNXK2m3hSCptf4romsrty5Hh64vsZ1nR4Z
+rNc3zdmMO4MZFWlccDQRpgvDmTj/+IqbQnsfMdPy8FoW8Wm/zPhKQQ22J1LXirnX
+5NoWhclvGNy2i4llOP26cNrvK+s5juGKJGhWe698LnrQZLMtzT27px/oqS7n14Ya
+zwIDAQAB
+-----END PUBLIC KEY-----
+"""
+# ======================================
 
 
-def _candidate_paths() -> list[str]:
-    candidates: list[str] = []
-    # 실행 파일 근처
-    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
-    candidates.append(os.path.join(base_dir, DEFAULT_FILENAME))
-    # 공용 데이터
-    progdata = os.getenv("PROGRAMDATA") or "/usr/local/share"
-    common_dir = os.path.join(progdata, VENDOR_DIRNAME, APP_DIRNAME)
-    candidates.append(os.path.join(common_dir, DEFAULT_FILENAME))
-    # 사용자 홈
-    home = os.path.expanduser('~')
-    home_dir = os.path.join(home, f".{APP_DIRNAME.lower()}")
-    candidates.append(os.path.join(home_dir, DEFAULT_FILENAME))
-    return candidates
+def machine_id() -> str:
+    try:
+        if platform.system() == "Windows":
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+            v, _ = winreg.QueryValueEx(k, "MachineGuid")
+            return v
+        elif platform.system() == "Darwin":
+            import subprocess
+            out = subprocess.check_output(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]).decode(errors="ignore")
+            return out.split('IOPlatformUUID" = "')[1].split('"')[0]
+        else:
+            return open("/etc/machine-id").read().strip()
+    except Exception:
+        return str(uuid.getnode())
 
 
-def _load_from_paths() -> str | None:
-    tok = os.environ.get(ENV_LICENSE_VAR)
-    if tok:
-        return tok.strip()
-    file_from_env = os.environ.get(ENV_LICENSE_FILE_VAR)
-    if file_from_env and os.path.exists(file_from_env):
+def _b64u_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def verify_license_text(lic_text: str) -> Tuple[bool, str, Dict[str, Any] | None]:
+    try:
+        lic = json.loads(lic_text)
+        payload_json = _b64u_decode(lic["payload"])
+        payload = json.loads(payload_json)
+        sig = _b64u_decode(lic["sig"])
+
+        pub = serialization.load_pem_public_key(PUBLIC_PEM)
+        pub.verify(sig, payload_json, padding.PKCS1v15(), hashes.SHA256())
+
+        dev = payload.get("dev") or ""
+        exp = payload.get("exp") or ""
+        if dev and dev != machine_id():
+            return False, "등록된 PC가 아닙니다.", None
+        if exp:
+            if datetime.now().date() > datetime.strptime(exp, "%Y-%m-%d").date():
+                return False, "라이선스가 만료되었습니다.", None
+        return True, "", payload
+    except Exception as e:
+        return False, f"라이선스 검증 실패: {e}", None
+
+
+def sign_license_with_private_pem(priv_pem_path: str, user: str, device_id: str, exp_yyyy_mm_dd: str) -> str:
+    payload = {"user": user, "dev": device_id, "exp": exp_yyyy_mm_dd, "ver": 1}
+    msg = json.dumps(payload, separators=(",", ":")).encode()
+    priv = serialization.load_pem_private_key(open(priv_pem_path, "rb").read(), password=None)
+    sig = priv.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    lic = {"payload": _b64u(msg), "sig": _b64u(sig)}
+    return json.dumps(lic, ensure_ascii=False)
+
+
+def load_license_from_disk() -> str | None:
+    for path in (LICENSE_PATH, PORTABLE_LICENSE):
         try:
-            return open(file_from_env, 'r', encoding='utf-8').read().strip()
-        except Exception:
-            pass
-    for p in _candidate_paths():
-        try:
-            if os.path.exists(p):
-                return open(p, 'r', encoding='utf-8').read().strip()
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
         except Exception:
             continue
     return None
 
 
-def verify_license_from_anywhere() -> Tuple[bool, Dict[str, Any] | str]:
-    tok = _load_from_paths()
-    if not tok:
-        return False, "라이선스가 없습니다(환경변수/파일)."
-    return verify_license(tok)
+def save_license_to_disk(text: str):
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(LICENSE_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
-def verify_license(license_str: str) -> Tuple[bool, Dict[str, Any] | str]:
+def watermark_excel(path: str, payload: Dict[str, Any] | None):
+    if not payload:
+        return
     try:
-        payload, sig = _parse_license(license_str)
-        pubkey = VerifyKey(base64.b64decode(PUBLIC_KEY_B64))
-        pubkey.verify(json.dumps(payload, separators=(',',':')).encode('utf-8'), sig)
-        exp = payload.get('exp')
-        if not exp:
-            return False, "만료(exp) 정보가 없습니다."
-        try:
-            exp_dt = datetime.date.fromisoformat(exp)
-        except Exception:
-            return False, "만료(exp) 형식 오류(YYYY-MM-DD)."
-        if exp_dt < datetime.date.today():
-            return False, f"라이선스 만료({exp})"
-        return True, payload
-    except BadSignatureError:
-        return False, "서명 검증 실패"
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        ws = wb.create_sheet("_meta")
+        ws.sheet_state = "hidden"
+        ws["A1"], ws["B1"] = "user", payload.get("user", "")
+        ws["A2"], ws["B2"] = "device", payload.get("dev", "") or machine_id()
+        ws["A3"], ws["B3"] = "exp", payload.get("exp", "")
+        wb.save(path)
     except Exception as e:
-        return False, f"검증 오류: {e}"
-
-
-def save_license_to_disk(license_str: str, path: str | None = None):
-    """라이선스를 기본 위치 중 하나에 저장"""
-    if path is None:
-        # 실행파일 근처에 저장
-        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.argv[0])))
-        path = os.path.join(base_dir, DEFAULT_FILENAME)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(license_str.strip())
-    except Exception:
-        pass
+        print("워터마크 실패:", e)

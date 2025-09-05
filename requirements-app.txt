@@ -3,4 +3,5 @@ selenium>=4.22
 pandas>=2.2
 pytube>=15.0.0
 requests>=2.32
-pynacl>=1.5
+cryptography>=41.0.0
+openpyxl>=3.1

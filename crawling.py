@@ -1,4 +1,4 @@
-import os, re, sys, time, random
+import os, re, sys, time, random, json
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, urlunparse, urlencode, parse_qs
 
@@ -47,31 +47,34 @@ def rsleep(min_s=0.1, max_s=0.5):
     time.sleep(random.uniform(min_s, max_s))
 
 # ---------- 드라이버 초기화 ----------
-import json
-
 def _load_driver_path_from_json():
     candidates = []
     base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     candidates.append(os.path.join(base_dir, "driver_path.json"))
+
     progdata = os.getenv("PROGRAMDATA") or "/usr/local/share"
     common_dir = os.path.join(progdata, "OneInsight", "UnifiedCrawler")
     candidates.append(os.path.join(common_dir, "driver_path.json"))
+
     home = os.path.expanduser("~")
     home_dir = os.path.join(home, ".unifiedcrawler")
     candidates.append(os.path.join(home_dir, "driver_path.json"))
+
     for p in candidates:
         try:
             if os.path.exists(p):
                 with open(p, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-                    d = j.get("chromedriver_path")
+                    data = json.load(f)
+                    d = data.get("chromedriver_path")
                     if d and os.path.exists(d):
                         return d
         except Exception:
             continue
     return None
 
+
 def initialize_driver(show_browser: bool):
+    """외부에서 설치된 ChromeDriver만 사용."""
     options = Options()
     if not show_browser:
         options.add_argument("--headless=new")
@@ -260,50 +263,116 @@ def crawl_fmkorea(list_url, cutoff, show_browser, log):
 # ---------- DCInside ----------
 def crawl_dcinside(list_url, cutoff, show_browser, log):
     rows = []
-    stale_pages = 0
     driver = initialize_driver(show_browser)
     log(f"[DC] cutoff = {cutoff:%Y-%m-%d %H:%M:%S}")
     try:
+        stale_pages = 0
         for page in range(1, MAX_PAGES_SOFT + 1):
-            page_url = add_or_replace_query_param(list_url, "page", page)
-            log(f"[DC] 목록 로드: page={page} | {page_url}")
-            driver.get(page_url); rsleep()
+            url = add_or_replace_query_param(list_url, "page", page)
+            log(f"[DC] 목록 page={page} | {url}")
+            driver.get(url); rsleep()
             base = driver.current_url
+
             trs = driver.find_elements(By.CSS_SELECTOR, "tr.ub-content.us-post")
-            log(f"[DC] 목록 행 {len(trs)}개")
+            log(f"[DC] 행 {len(trs)}")
             if not trs:
                 stale_pages += 1
                 if stale_pages >= STALE_PAGE_LIMIT:
-                    log("[DC] 행 없음/오래된 페이지 연속 → 종료")
+                    log("[DC] 연속 없음 → 종료")
                     break
                 continue
+            stale_pages = 0
+
+            if page >= 2:
+                try:
+                    d0 = trs[0].find_element(By.CSS_SELECTOR, "td.gall_date")
+                    title_attr = (d0.get_attribute("title") or "").strip()
+                    cell_text = (d0.text or "").strip()
+                    first_txt = title_attr or cell_text
+                    first_dt = None
+                    if title_attr:
+                        try:
+                            first_dt = datetime.strptime(title_attr, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                first_dt = datetime.strptime(title_attr, "%Y-%m-%d %H:%M")
+                            except ValueError:
+                                first_dt = None
+                    if first_dt is None and cell_text:
+                        m = re.match(r"^(\d{1,2}):(\d{2})$", cell_text)
+                        if m:
+                            h, mi = map(int, m.groups())
+                            now = datetime.now()
+                            first_dt = datetime(now.year, now.month, now.day, h, mi)
+                        else:
+                            m = re.match(r"^(\d{2})\.(\d{2})$", cell_text)
+                            if m:
+                                M, d2 = map(int, m.groups())
+                                now = datetime.now()
+                                first_dt = datetime(now.year, M, d2, 0, 0)
+                    if first_dt and first_dt < cutoff:
+                        log(f"[DC] page={page} 첫 글 {first_txt} < cutoff → 종료")
+                        break
+                except Exception:
+                    pass
+
             found_recent = False
             for tr in trs:
                 try:
                     a = tr.find_element(By.CSS_SELECTOR, "td.gall_tit a[href]")
                     href = urljoin(base, a.get_attribute("href"))
                     title = a.text.strip() or (a.get_attribute("title") or "").strip()
+
                     d = tr.find_element(By.CSS_SELECTOR, "td.gall_date")
-                    date_text = (d.get_attribute("title") or d.text or "").strip()
-                    dt = parse_dt_dc_flexible(date_text)
+                    title_attr = (d.get_attribute("title") or "").strip()
+                    cell_text = (d.text or "").strip()
+
+                    dt = None
+                    date_text = ""
+                    if title_attr:
+                        try:
+                            dt = datetime.strptime(title_attr, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                dt = datetime.strptime(title_attr, "%Y-%m-%d %H:%M")
+                            except ValueError:
+                                dt = None
+                        date_text = title_attr
+                    else:
+                        m = re.match(r"^(\d{1,2}):(\d{2})$", cell_text)
+                        if m:
+                            h, mi = map(int, m.groups())
+                            now = datetime.now()
+                            dt = datetime(now.year, now.month, now.day, h, mi)
+                            date_text = f"{now.year}-{now.month:02d}-{now.day:02d} {h:02d}:{mi:02d}"
+                        else:
+                            m = re.match(r"^(\d{2})\.(\d{2})$", cell_text)
+                            if m:
+                                M, d2 = map(int, m.groups())
+                                now = datetime.now()
+                                dt = datetime(now.year, M, d2, 0, 0)
+                                date_text = f"{now.year}-{M:02d}-{d2:02d} 00:00"
+
                     v = tr.find_element(By.CSS_SELECTOR, "td.gall_count")
                     views = to_int_or_none(v.text)
+
                     if dt and dt >= cutoff:
                         rows.append({
                             "Site": "DCInside",
-                            "Title": title if title else "제목 없음",
-                            "Date": date_text,
+                            "Title": title or "제목 없음",
+                            "Date": date_text or (title_attr or cell_text),
                             "DateISO": dt.strftime("%Y-%m-%d %H:%M:%S"),
                             "Views": views,
-                            "Link": href
+                            "Link": href,
                         })
                         found_recent = True
                 except Exception as e:
-                    log(f"[DC] 행 실패: {e}")
+                    log(f"[DC] 행 파싱 실패: {e}")
+
             if not found_recent:
                 stale_pages += 1
                 if stale_pages >= STALE_PAGE_LIMIT:
-                    log("[DC] 최근 글 없는 페이지 연속 임계치 → 종료")
+                    log("[DC] 최근 글 없음 연속 → 종료")
                     break
             else:
                 stale_pages = 0
