@@ -73,8 +73,8 @@ def _load_driver_path_from_json():
     return None
 
 
+# crawling.py (실행폴더 → ENV → JSON)
 def initialize_driver(show_browser: bool):
-    """외부에서 설치된 ChromeDriver만 사용."""
     options = Options()
     if not show_browser:
         options.add_argument("--headless=new")
@@ -83,6 +83,40 @@ def initialize_driver(show_browser: bool):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
+    # 0) 로컬 후보 경로들: MEIPASS, exe 폴더, 스크립트 폴더, 현재 작업폴더
+    driver_names = ["chromedriver.exe"] if os.name == "nt" else ["chromedriver", "chromedriver.exe"]
+    local_candidates = []
+
+    # (a) PyInstaller onefile 임시 해제 폴더
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        for n in driver_names:
+            local_candidates.append(os.path.join(meipass, n))
+
+    # (b) 실제 실행 파일이 있는 폴더 (onefile/onedir 배포 모두 커버)
+    exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else None
+    if exe_dir:
+        for n in driver_names:
+            local_candidates.append(os.path.join(exe_dir, n))
+
+    # (c) 스크립트 파일 폴더 (개발 환경에서 유용)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for n in driver_names:
+        local_candidates.append(os.path.join(script_dir, n))
+
+    # (d) 현재 작업 폴더
+    for n in driver_names:
+        local_candidates.append(os.path.join(os.getcwd(), n))
+
+    # 로컬 드라이버 우선 사용
+    for p in local_candidates:
+        if os.path.exists(p):
+            service = Service(p)
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(25)
+            return driver
+
+    # 1) 환경변수
     env_path = os.environ.get("CHROMEDRIVER_PATH")
     if env_path and os.path.exists(env_path):
         service = Service(env_path)
@@ -90,6 +124,7 @@ def initialize_driver(show_browser: bool):
         driver.set_page_load_timeout(25)
         return driver
 
+    # 2) JSON (ProgramData 등)
     json_path = _load_driver_path_from_json()
     if json_path and os.path.exists(json_path):
         service = Service(json_path)
@@ -97,20 +132,13 @@ def initialize_driver(show_browser: bool):
         driver.set_page_load_timeout(25)
         return driver
 
-    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    local_driver = os.path.join(base_dir, "chromedriver.exe" if os.name == "nt" else "chromedriver")
-    if os.path.exists(local_driver):
-        service = Service(local_driver)
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(25)
-        return driver
-
     raise RuntimeError(
         "ChromeDriver를 찾을 수 없습니다.\n"
-        "1) 드라이버 설치기를 먼저 실행하세요.\n"
-        "2) 또는 CHROMEDRIVER_PATH 환경변수에 경로를 지정하세요.\n"
-        "3) 또는 실행 폴더에 chromedriver(.exe)를 두세요."
+        "1) 폴더의 ChromeDriverSetup.exe를 먼저 실행하세요.\n"
+        "2) 또는 exe와 같은 폴더에 chromedriver(.exe)를 두세요.\n"
+        "3) 또는 CHROMEDRIVER_PATH/driver_path.json을 사용하세요."
     )
+
 
 # ---------- 날짜 파싱 ----------
 _DOT_DT_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$")

@@ -8,7 +8,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("원초적 인사이트 – 통합 크롤러")
-        self.resize(1280, 800)
+        self.resize(1280, 800) 
 
         tabs = QTabWidget()
         tabs.addTab(CommunityCrawlerWidget(), "커뮤니티 크롤러")
