@@ -317,6 +317,7 @@ class CommunityCrawlerWidget(QWidget):
 
         self.btn_run.setEnabled(False)
         self.append_log(f"{ts()} | 작업 시작")
+
         self.thread = CrawlerThread(comm, url, days, hours, outp, show, self.license_payload)
         self.thread.log_line.connect(self.append_log)
         self.thread.done.connect(lambda p,c: QMessageBox.information(self, "완료", f"저장 완료\n{p}\n총 {c}건"))
