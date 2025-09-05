@@ -1,4 +1,4 @@
-import os, re, sys, time, random
+import os, re, sys, time, random, json
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, urlunparse, urlencode, parse_qs
 
@@ -47,13 +47,34 @@ def rsleep(min_s=0.1, max_s=0.5):
     time.sleep(random.uniform(min_s, max_s))
 
 # ---------- 드라이버 초기화 ----------
+def _load_driver_path_from_json():
+    candidates = []
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.join(base_dir, "driver_path.json"))
+
+    progdata = os.getenv("PROGRAMDATA") or "/usr/local/share"
+    common_dir = os.path.join(progdata, "OneInsight", "UnifiedCrawler")
+    candidates.append(os.path.join(common_dir, "driver_path.json"))
+
+    home = os.path.expanduser("~")
+    home_dir = os.path.join(home, ".unifiedcrawler")
+    candidates.append(os.path.join(home_dir, "driver_path.json"))
+
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    d = data.get("chromedriver_path")
+                    if d and os.path.exists(d):
+                        return d
+        except Exception:
+            continue
+    return None
+
+
 def initialize_driver(show_browser: bool):
-    """
-    드라이버 자동 관리 우선순위:
-    1) Selenium Manager
-    2) webdriver_manager
-    3) 로컬 chromedriver.exe
-    """
+    """외부에서 설치된 ChromeDriver만 사용."""
     options = Options()
     if not show_browser:
         options.add_argument("--headless=new")
@@ -62,34 +83,34 @@ def initialize_driver(show_browser: bool):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
-    # 1) Selenium Manager
-    try:
-        driver = webdriver.Chrome(options=options)
+    env_path = os.environ.get("CHROMEDRIVER_PATH")
+    if env_path and os.path.exists(env_path):
+        service = Service(env_path)
+        driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(25)
         return driver
-    except Exception:
-        pass
 
-    # 2) webdriver_manager
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        driver_path = ChromeDriverManager(cache_valid_range=30).install()
-        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+    json_path = _load_driver_path_from_json()
+    if json_path and os.path.exists(json_path):
+        service = Service(json_path)
+        driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(25)
         return driver
-    except Exception as e2:
-        # 3) 로컬 폴백
-        base_dir = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
-        local_driver = os.path.join(base_dir, "chromedriver.exe")
-        if not os.path.exists(local_driver):
-            raise RuntimeError(
-                "ChromeDriver 자동 설치 실패.\n"
-                f"사유: {e2}\n"
-                f"→ 인터넷/프록시/방화벽 확인 또는 chromedriver.exe를 다음 위치에 두세요:\n{base_dir}"
-            )
-        driver = webdriver.Chrome(service=Service(local_driver), options=options)
+
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    local_driver = os.path.join(base_dir, "chromedriver.exe" if os.name == "nt" else "chromedriver")
+    if os.path.exists(local_driver):
+        service = Service(local_driver)
+        driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(25)
         return driver
+
+    raise RuntimeError(
+        "ChromeDriver를 찾을 수 없습니다.\n"
+        "1) 드라이버 설치기를 먼저 실행하세요.\n"
+        "2) 또는 CHROMEDRIVER_PATH 환경변수에 경로를 지정하세요.\n"
+        "3) 또는 실행 폴더에 chromedriver(.exe)를 두세요."
+    )
 
 # ---------- 날짜 파싱 ----------
 _DOT_DT_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$")

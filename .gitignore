@@ -3,3 +3,4 @@ __pycache__/
 
 license.lic
 *.pem
+driver_path.json
