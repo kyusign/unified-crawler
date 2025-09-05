@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 # (tkinter App는 __main__에서만 실행되므로 import만으로 창이 뜨지 않음)
 import crawling as community
 from licensing.license_manager import (
-    verify_license, save_license_to_disk, load_license_from_disk
+    verify_license, verify_license_from_anywhere, save_license_to_disk
 )
 
 def ts():
@@ -92,7 +92,7 @@ class CommunityCrawlerWidget(QWidget):
         self.thread = None
         self.license_ok = False
         self._build_ui()
-        self._try_auto_license()
+        self._auto_verify()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -101,7 +101,7 @@ class CommunityCrawlerWidget(QWidget):
         # (A) 라이선스 영역
         licRow = QHBoxLayout()
         self.lic_edit = QLineEdit()
-        self.lic_edit.setPlaceholderText("라이선스 키를 입력하거나 license.txt에 저장해두세요")
+        self.lic_edit.setPlaceholderText("라이선스 키를 입력하거나 license.dat로 저장해두세요")
         self.lic_btn = QPushButton("인증")
         self.lic_btn.clicked.connect(self.on_verify_license)
         self.lic_status = QLabel("상태: 미인증")
@@ -159,45 +159,40 @@ class CommunityCrawlerWidget(QWidget):
         self._update_run_enabled()
 
     # ------------- 라이선스 -------------
-    def _try_auto_license(self):
-        lic = load_license_from_disk()  # 프로젝트 루트의 license.txt 탐색
-        if lic:
-            self.lic_edit.setText(lic)
-            self._verify_and_apply(lic, silent=True)
+    def _auto_verify(self):
+        ok, payload_or_msg = verify_license_from_anywhere()
+        if ok and "community" in payload_or_msg.get("features", []):
+            self.license_ok = True
+            owner = payload_or_msg.get("name") or payload_or_msg.get("email", "")
+            exp = payload_or_msg.get("exp", "")
+            self.lic_status.setText(f"상태: 인증됨 (만료 {exp}) – {owner}")
+            self.lic_status.setStyleSheet("color:#1B5E20;")
+        else:
+            self.license_ok = False
+            self.lic_status.setText("상태: 미인증")
+            self.lic_status.setStyleSheet("color:#B00020;")
+        self._update_run_enabled()
 
     def on_verify_license(self):
         lic = self.lic_edit.text().strip()
         if not lic:
             QMessageBox.warning(self, "알림", "라이선스 키를 입력하세요.")
             return
-        self._verify_and_apply(lic, silent=False)
-
-    def _verify_and_apply(self, lic: str, silent: bool):
         ok, info_or_msg = verify_license(lic)
-        if ok:
-            # 기능 권한 확인(예: community 권한 필요)
-            features = info_or_msg.get("features", [])
+        if ok and "community" in info_or_msg.get("features", []):
+            self.license_ok = True
             exp = info_or_msg.get("exp", "")
-            owner = info_or_msg.get("name", "") or info_or_msg.get("email", "")
-            if "community" not in features:
-                self.license_ok = False
-                self.lic_status.setText("상태: 기능권한 없음")
-                self.lic_status.setStyleSheet("color:#B00020;")
-                if not silent:
-                    QMessageBox.critical(self, "오류", "이 라이선스로는 '커뮤니티' 기능을 사용할 수 없습니다.")
-            else:
-                self.license_ok = True
-                self.lic_status.setText(f"상태: 인증됨 (만료 {exp}) – {owner}")
-                self.lic_status.setStyleSheet("color:#1B5E20;")
-                save_license_to_disk(lic)
-                if not silent:
-                    QMessageBox.information(self, "성공", "라이선스 인증에 성공했습니다.")
+            owner = info_or_msg.get("name") or info_or_msg.get("email", "")
+            self.lic_status.setText(f"상태: 인증됨 (만료 {exp}) – {owner}")
+            self.lic_status.setStyleSheet("color:#1B5E20;")
+            save_license_to_disk(lic)
+            QMessageBox.information(self, "성공", "라이선스 인증에 성공했습니다.")
         else:
             self.license_ok = False
-            self.lic_status.setText(f"상태: 미인증")
+            msg = info_or_msg if isinstance(info_or_msg, str) else "권한 부족"
+            self.lic_status.setText("상태: 미인증")
             self.lic_status.setStyleSheet("color:#B00020;")
-            if not silent:
-                QMessageBox.critical(self, "오류", f"라이선스 인증 실패: {info_or_msg}")
+            QMessageBox.critical(self, "오류", f"라이선스 인증 실패: {msg}")
         self._update_run_enabled()
 
     def _update_run_enabled(self):

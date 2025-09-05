@@ -1,6 +1,5 @@
 PySide6>=6.6
 selenium>=4.22
-webdriver-manager>=4.0.2
 pandas>=2.2
 pytube>=15.0.0
 requests>=2.32
