@@ -2,7 +2,6 @@ import os, re, sys, time, random, json
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urljoin, urlunparse, urlencode, parse_qs
 
-import pandas as pd  # 일부 유틸에서 사용
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
