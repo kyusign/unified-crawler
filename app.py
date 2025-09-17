@@ -1,4 +1,4 @@
-# app.py  — 정리본 (전체 복붙)
+# app.py — YouTube Data API 전환판
 from diag_bootstrap import install as _install_diag
 _install_diag()  # 반드시 가장 먼저
 
@@ -16,9 +16,9 @@ def BOOTLOG(msg: str):
     from diag_bootstrap import log
     log(msg)
 
-# pytube after 패치 (pytube import 전에)
-from pytube_patches import apply_pytube_after_patch
-apply_pytube_after_patch()
+# (변경) pytube 패치 제거 — 더 이상 사용하지 않음
+# from pytube_patches import apply_pytube_after_patch
+# apply_pytube_after_patch()
 
 BOOTLOG("STEP-1: before PySide6 import")
 from PySide6.QtCore import Qt, QCoreApplication
@@ -38,7 +38,7 @@ try:
 except Exception as e:
     BOOTLOG(f"Add Qt lib path failed: {e!r}")
 
-# 나머지 앱 위젯/테마 import (pytube 의존 코드가 있다면 여기 이후)
+# 나머지 앱 위젯/테마 import
 from community_tab import CommunityCrawlerWidget
 from youtube_tab import YouTubeSearchWidget
 from theme import apply_theme
