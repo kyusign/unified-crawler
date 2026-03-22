@@ -1,24 +1,16 @@
-# diag_bootstrap.py
-"""
-Diagnostic bootstrap for PySide6/Nuitka packaging.
-
-- Call install() as the very first code in your main script (before importing PySide6).
-- Writes boot.log next to this file.
-- Resolves Qt plugin paths for DEV (site-packages) and FROZEN (dist/EXE).
-- Adds DLL search dirs on Windows.
-- **EARLY** Shiboken pre-load guard runs before anything else to avoid
-  "PyState_AddModule: module ... already added".
-"""
 from __future__ import annotations
 import os
 import sys
 import time
-import traceback
 from pathlib import Path
 import faulthandler
-import importlib, importlib.machinery, importlib.util
 
-LOG_PATH = Path(__file__).resolve().parent / "boot.log"
+from app_paths import log_dir
+
+# 로그는 사용자 폴더 쪽에 고정(배포 exe 옆/임시폴더가 아님)
+_LOG_DIR = log_dir()
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = _LOG_DIR / "boot.log"
 
 def log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -32,166 +24,121 @@ def log(msg: str):
         except Exception:
             pass
 
-def _early_shiboken_preload():
-    """
-    가장 먼저 호출되어 Shiboken 네이티브 확장을 '한 번만' 초기화하고,
-    이후 다른 경로/이름으로 재초기화되지 않도록 sys.modules에 별칭을 등록합니다.
-    """
+def runtime_is_frozen() -> bool:
+    """여러 휴리스틱으로 배포 실행(EXE) 여부를 감지."""
     try:
-        # dist/EXE 위치와 스크립트 위치를 우선 탐색
+        if os.environ.get("UC_FORCE_FROZEN") == "1":
+            return True
+
+        if bool(getattr(sys, "frozen", False)):
+            return True
+        if hasattr(sys, "_MEIPASS"):  # PyInstaller 관성 지원
+            return True
+
         try:
-            exe_dir = Path(sys.executable).resolve().parent
-        except Exception:
-            exe_dir = Path(os.getcwd()).resolve()
-
-        search_dirs = [
-            exe_dir,
-            exe_dir / "shiboken6",
-            exe_dir / "PySide6",
-            Path(__file__).resolve().parent,
-        ]
-
-        candidates = []
-        patterns = ("Shiboken*.pyd", "Shiboken*.dll", "shiboken*.pyd", "shiboken*.dll")
-        for d in search_dirs:
-            try:
-                for pat in patterns:
-                    candidates += list(d.rglob(pat))
-            except Exception:
-                pass
-
-        target = None
-        if candidates:
-            # 가장 먼저 찾은 네이티브 확장 파일 채택
-            target = candidates[0]
-
-        if target and target.exists():
-            loader = importlib.machinery.ExtensionFileLoader("shiboken6.Shiboken", str(target))
-            spec = importlib.util.spec_from_loader(loader.name, loader)
-            module = importlib.util.module_from_spec(spec)
-            loader.exec_module(module)
-            # 여러 이름으로 미리 등록 → 이후 중복 초기화 방지
-            for key in ("Shiboken", "shiboken6.Shiboken", "shiboken6.abi3", "shiboken6"):
-                sys.modules.setdefault(key, module)
-            log(f"[EARLY] Shiboken preloaded from: {target}")
-            return
-
-        # 파일 기반 선로딩 실패 시, 일반 import 시도
-        try:
-            mod = importlib.import_module("shiboken6.Shiboken")
-            for key in ("Shiboken", "shiboken6.Shiboken", "shiboken6.abi3"):
-                sys.modules.setdefault(key, mod)
-            log("[EARLY] Shiboken loaded via importlib fallback")
-        except Exception as e:
-            log(f"[EARLY] Shiboken import fallback failed: {e!r}")
-    except Exception as e:
-        log(f"[EARLY] Shiboken preload unexpected failure: {e!r}")
-
-def install():
-    """Call this at the very top of your main script (before importing PySide6)."""
-    # --- start clean log ---
-    try:
-        LOG_PATH.unlink(missing_ok=True)
-    except Exception:
-        try:
-            if LOG_PATH.exists():
-                LOG_PATH.unlink()
+            if globals().get("__compiled__", None) is not None:
+                return True
         except Exception:
             pass
 
-    # 치명 크래시까지 파일로 받기
+        try:
+            import builtins as _bi
+            if getattr(_bi, "__compiled__", None) is True:
+                return True
+        except Exception:
+            pass
+
+        try:
+            exe_name = os.path.basename(sys.executable).lower()
+            if exe_name.endswith(".exe") and not exe_name.startswith(("python", "py")):
+                return True
+        except Exception:
+            pass
+
+        return False
+    except Exception:
+        return False
+
+def install():
+    """Call this at the very top of your main script (before importing PySide6)."""
+    try:
+        LOG_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     try:
         fh = open(LOG_PATH, "a", encoding="utf-8")
         faulthandler.enable(fh)
     except Exception:
         pass
 
-    log("=== BOOT START ===")
-    log(f"Python: {sys.version.replace(os.linesep, ' ')}")
-    log(f"Exe: {sys.executable}")
-    log(f"CWD: {os.getcwd()}")
-    log("faulthandler enabled")
-
-    # ---------- (1) 가장 먼저 Shiboken 선로딩 가드 ----------
-    _early_shiboken_preload()
-
-    # ---------- (2) DEV/FROZEN 모드에 따라 Qt 플러그인 경로 설정 ----------
+    # FROZEN 판정
+    is_frozen_sys = bool(getattr(sys, "frozen", False))
+    has_meipass   = hasattr(sys, "_MEIPASS")
     try:
-        is_frozen = bool(getattr(sys, "frozen", False))
+        import builtins as _bi
+        has_compiled_attr = hasattr(_bi, "__compiled__")
+        compiled_val_bi   = getattr(_bi, "__compiled__", None)
     except Exception:
-        is_frozen = False
+        has_compiled_attr = False
+        compiled_val_bi   = None
+    compiled_val_mod = globals().get("__compiled__", None)
+    is_frozen = runtime_is_frozen()
 
-    qt_plugins: Path | None = None
-    base: Path | None = None
+    # ⚠ 핵심 변경: qt.conf 무력화 플래그는 DEV에서만 기본 on, FROZEN에서는 off
+    try:
+        if is_frozen:
+            # Nuitka 번들의 내부 qt.conf가 필요할 수 있으므로 제거
+            if os.environ.pop("PYSIDE_DISABLE_INTERNAL_QT_CONF", None) is not None:
+                log("Unset PYSIDE_DISABLE_INTERNAL_QT_CONF for FROZEN")
+        else:
+            os.environ.setdefault("PYSIDE_DISABLE_INTERNAL_QT_CONF", "1")
+    except Exception as e:
+        log(f"PYSIDE flag adjust failed: {e!r}")
 
-    if is_frozen:
+    # 진단 로그
+    try:
+        log("=== BOOT START ===")
+        log(f"Python: {sys.version.replace(os.linesep, ' ')}")
         try:
-            exe_dir = Path(sys.executable).resolve().parent
+            log(f"Exe: {sys.executable}")
         except Exception:
-            exe_dir = Path(os.getcwd()).resolve()
-        base = exe_dir
-        qt_plugins = base / "PySide6" / "qt-plugins"
-        if not qt_plugins.exists():
-            alt = base / "PySide6" / "plugins"
-            if alt.exists():
-                qt_plugins = alt
-    else:
-        # DEV: site-packages 내 PySide6 위치에서 plugins 찾기
+            log("Exe: <unknown>")
         try:
-            import PySide6  # 위치 확인만 (실패해도 치명 아님)
-            site_pyside = Path(PySide6.__file__).resolve().parent
+            log(f"CWD: {os.getcwd()}")
         except Exception:
-            site_pyside = Path(sys.executable).resolve().parent
-        base = site_pyside
-        for cand in (site_pyside / "plugins", site_pyside / "Qt" / "plugins", site_pyside / "qt-plugins"):
-            if cand.exists():
-                qt_plugins = cand
-                break
-        if qt_plugins is None:
-            qt_plugins = site_pyside / "plugins"  # 존재하지 않을 수도 있지만 기록용
+            log("CWD: <unknown>")
 
-    platforms = qt_plugins / "platforms" if qt_plugins is not None else None
-
-    # 존재하는 경로에만 세팅
-    os.environ.pop("QT_PLUGIN_PATH", None)
-    if platforms and platforms.exists():
-        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
-    os.environ.setdefault("PYSIDE_DISABLE_INTERNAL_QT_CONF", "1")
-    # 필요 시 외부에서 QT_DEBUG_PLUGINS=1 설정
-
-    log(f"MODE: {'FROZEN' if is_frozen else 'DEV'}")
-    log(f"RESOLVED base={base}")
-    log(f"QT_PLUGINS={qt_plugins} exists={qt_plugins.exists() if qt_plugins else False}")
-    log(f"QT_PLATFORMS={platforms} exists={platforms.exists() if platforms else False}")
-
-    # DLL 검색 경로 보강(존재할 때만)
-    if hasattr(os, "add_dll_directory"):
-        for p in filter(None, {
-            base,
-            base / "PySide6" if base else None,
-            base / "PySide6" / "Qt" / "bin" if base else None,
-            qt_plugins,
-            platforms,
-        }):
-            try:
-                if p.exists():
-                    os.add_dll_directory(str(p))
-                    log(f"add_dll_directory: {p}")
-            except Exception as e:
-                log(f"add_dll_directory failed: {p} :: {e!r}")
-
-    # 진단용 덤프
-    log("sys.path:")
-    for p in sys.path:
+        log(f"sys.frozen present: {is_frozen_sys}")
+        log(f"has _MEIPASS: {has_meipass}")
+        log(f"builtins.__compiled__ present: {has_compiled_attr} value: {compiled_val_bi!r}")
+        log(f"module __compiled__ value: {compiled_val_mod!r}")
         try:
-            log(f"  - {p}")
+            log(f"exe basename: {os.path.basename(sys.executable).lower()}")
         except Exception:
             pass
-    log("env (filtered):")
-    for k in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_PLUGIN_PATH", "PYSIDE_DISABLE_INTERNAL_QT_CONF", "QT_DEBUG_PLUGINS", "PATH"):
-        v = os.environ.get(k)
-        if v:
-            log(f"  {k}={v}")
+        log(f"Derived is_frozen: {is_frozen}")
+
+        log("env (filtered):")
+        for k in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_PLUGIN_PATH",
+                  "PYSIDE_DISABLE_INTERNAL_QT_CONF", "QT_DEBUG_PLUGINS", "PATH"):
+            v = os.environ.get(k)
+            if v:
+                log(f"  {k}={v}")
+
+        log("sys.path:")
+        for p in sys.path:
+            try:
+                log(f"  - {p}")
+            except Exception:
+                pass
+
+        log(f"MODE: {'FROZEN' if is_frozen else 'DEV'}")
+    except Exception as e:
+        try:
+            log(f"BOOT DIAG FAILED: {e!r}")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     install()
