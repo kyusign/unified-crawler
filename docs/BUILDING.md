@@ -22,12 +22,13 @@ python -m pip install pyinstaller
 From the project root:
 
 ```bash
-python packaging/build.py --onedir --clean
+python packaging/build.py --onedir --clean --package-zip
 ```
 
 Output:
 
 - `dist/YouTubeCollector.app`
+- `dist/YouTubeCollector.zip`
 
 Optional one-file build:
 
@@ -52,7 +53,8 @@ python packaging/build.py --onefile --clean
 The repository now includes [build-mac.yml](/c:/Users/yesun/mac_crawler 수정/.github/workflows/build-mac.yml).
 
 - Push to `main` or start the workflow manually with `workflow_dispatch`.
-- It builds two artifacts on GitHub-hosted macOS runners:
-  - `YouTubeCollector-macos-arm64`
-  - `YouTubeCollector-macos-x86_64`
-- Download them from the workflow run's `Artifacts` section.
+- It builds two distributable zip files on GitHub-hosted macOS runners:
+  - `YouTubeCollector-macos-arm64.zip`
+  - `YouTubeCollector-macos-x86_64.zip`
+- Those zip files are the files you hand to users.
+- After a user unzips on macOS, they can run `YouTubeCollector.app`.

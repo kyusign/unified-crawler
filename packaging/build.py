@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,7 +23,40 @@ def parse_args() -> argparse.Namespace:
         choices=("x86_64", "arm64", "universal2"),
         help="macOS target architecture to pass through to PyInstaller.",
     )
+    parser.add_argument(
+        "--package-zip",
+        action="store_true",
+        help="Package the generated macOS .app bundle into a distributable zip file.",
+    )
+    parser.add_argument(
+        "--zip-name",
+        help="Name of the generated distributable zip file.",
+    )
     return parser.parse_args()
+
+
+def package_mac_app(app_path: Path, zip_path: Path) -> None:
+    if sys.platform != "darwin":
+        raise SystemExit("--package-zip is only supported on macOS.")
+
+    if not app_path.exists():
+        raise SystemExit(f"App bundle not found: {app_path}")
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    zip_path.unlink(missing_ok=True)
+
+    subprocess.run(
+        [
+            "ditto",
+            "-c",
+            "-k",
+            "--keepParent",
+            "--sequesterRsrc",
+            str(app_path),
+            str(zip_path),
+        ],
+        check=True,
+    )
 
 
 def main() -> None:
@@ -83,6 +117,10 @@ def main() -> None:
         pyinstaller_args.append("--osx-bundle-identifier=com.oneinsight.youtubecollector")
 
     PyInstaller.__main__.run(pyinstaller_args)
+
+    if args.package_zip:
+        zip_name = args.zip_name or f"{args.name}.zip"
+        package_mac_app(dist_dir / f"{args.name}.app", dist_dir / zip_name)
 
 
 if __name__ == "__main__":

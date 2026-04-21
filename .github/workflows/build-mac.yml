@@ -17,11 +17,11 @@ jobs:
           - name: macOS Apple Silicon
             runner: macos-15
             target_arch: arm64
-            artifact_name: YouTubeCollector-macos-arm64
+            zip_name: YouTubeCollector-macos-arm64.zip
           - name: macOS Intel
             runner: macos-15-intel
             target_arch: x86_64
-            artifact_name: YouTubeCollector-macos-x86_64
+            zip_name: YouTubeCollector-macos-x86_64.zip
 
     steps:
       - name: Checkout repository
@@ -38,14 +38,14 @@ jobs:
           python -m pip install -r requirements-app.txt
           python -m pip install pyinstaller
 
-      - name: Build app bundle
+      - name: Build distributable zip
         run: |
-          python packaging/build.py --onedir --clean --target-arch ${{ matrix.target_arch }}
+          python packaging/build.py --onedir --clean --target-arch ${{ matrix.target_arch }} --package-zip --zip-name ${{ matrix.zip_name }}
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/
+          path: dist/${{ matrix.zip_name }}
+          archive: false
           if-no-files-found: error
           retention-days: 14
