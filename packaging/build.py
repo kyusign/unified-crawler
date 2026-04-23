@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def package_mac_app(app_path: Path, zip_path: Path) -> None:
+def package_mac_app(app_path: Path, zip_path: Path, guide_path: Path | None = None) -> None:
     if sys.platform != "darwin":
         raise SystemExit("--package-zip is only supported on macOS.")
 
@@ -45,18 +45,29 @@ def package_mac_app(app_path: Path, zip_path: Path) -> None:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     zip_path.unlink(missing_ok=True)
 
+    staging_dir = zip_path.parent / f".{zip_path.stem}-package"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_app = staging_dir / app_path.name
+    subprocess.run(["ditto", str(app_path), str(staged_app)], check=True)
+
+    if guide_path and guide_path.exists():
+        shutil.copy2(guide_path, staging_dir / "사용설명서_YouTubeCollector.md")
+
     subprocess.run(
         [
             "ditto",
             "-c",
             "-k",
-            "--keepParent",
             "--sequesterRsrc",
-            str(app_path),
+            ".",
             str(zip_path),
         ],
+        cwd=staging_dir,
         check=True,
     )
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def main() -> None:
@@ -120,7 +131,11 @@ def main() -> None:
 
     if args.package_zip:
         zip_name = args.zip_name or f"{args.name}.zip"
-        package_mac_app(dist_dir / f"{args.name}.app", dist_dir / zip_name)
+        package_mac_app(
+            dist_dir / f"{args.name}.app",
+            dist_dir / zip_name,
+            project_root / "docs" / "USER_GUIDE_ko.md",
+        )
 
 
 if __name__ == "__main__":
