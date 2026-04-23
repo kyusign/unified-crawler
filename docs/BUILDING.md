@@ -57,5 +57,5 @@ The repository now includes [build-mac.yml](/c:/Users/yesun/mac_crawler 수정/.
   - `YouTubeCollector-macos-arm64.zip`
   - `YouTubeCollector-macos-x86_64.zip`
 - Those zip files are the files you hand to users.
-- Each zip includes `YouTubeCollector.app` and `사용설명서_YouTubeCollector.md`.
+- Each zip includes `YouTubeCollector.app` and `USER_GUIDE_ko.md`.
 - After a user unzips on macOS, they can move `YouTubeCollector.app` to Applications and run it.

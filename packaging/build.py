@@ -53,7 +53,7 @@ def package_mac_app(app_path: Path, zip_path: Path, guide_path: Path | None = No
     subprocess.run(["ditto", str(app_path), str(staged_app)], check=True)
 
     if guide_path and guide_path.exists():
-        shutil.copy2(guide_path, staging_dir / "사용설명서_YouTubeCollector.md")
+        shutil.copy2(guide_path, staging_dir / "USER_GUIDE_ko.md")
 
     subprocess.run(
         [
