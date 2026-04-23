@@ -1,11 +1,9 @@
-# youtube_tab.py — Data API + 'API 키 설정' UI 포함판
-# (자막 제거 + 별점 컬럼 + 길이(재생시간) 컬럼 추가 + 필터에 별점 선택 + 디자인 개선)
+# youtube_tab.py — Data API + 'API 키 설정 & 라이선스 필수' UI
+# (추천도 관련 기능/열/필터/내부지수 완전 제거 + 길이 컬럼 + 좋아요/댓글 + 간결 안내 + 디자인/안정성 유지)
 import webbrowser
 from urllib.request import urlopen
-import math
-
 import xlsxwriter
-from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer, QSignalBlocker
 from PySide6.QtGui import QPixmap, QDesktopServices, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -13,24 +11,12 @@ from PySide6.QtWidgets import (
     QHeaderView, QProgressBar, QComboBox, QDialog, QFormLayout,
     QDialogButtonBox, QAbstractItemView, QCheckBox, QFrame
 )
-
 import logging
 import youtube_api_util as ytu
 
 logger = logging.getLogger("ytcrawl")
 
-# ===== 별 등급 안내(대중적 설명, 임계값/공식은 노출 X) =====
-STARS_PUBLIC_HELP = (
-    "별점 안내\n"
-    "• ⭐ : 채널 규모 대비 반응이 낮은 편\n"
-    "• ⭐⭐ : 약간 아쉬움\n"
-    "• ⭐⭐⭐ : 보통 이상, 준수함\n"
-    "• ⭐⭐⭐⭐ : 반응이 매우 좋은 편\n"
-    "• ⭐⭐⭐⭐⭐ : 탁월한 반응\n"
-    "※ 채널 구독자 수가 없으면 별점은 N/A"
-)
-
-# ===== 유틸: 길이 포맷 =====
+# ===== 공통 유틸 =====
 def format_duration(seconds: int) -> str:
     try:
         s = max(0, int(seconds or 0))
@@ -42,6 +28,25 @@ def format_duration(seconds: int) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{ss:02d}"
     return f"{m}:{ss:02d}"
+
+# ========== 공통 카드형 안내 다이얼로그 (간결·깔끔) ==========
+class InfoDialog(QDialog):
+    def __init__(self, title: str, lines: list[str], parent=None, ok_text="확인"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        root = QVBoxLayout(self); root.setContentsMargins(12, 12, 12, 12); root.setSpacing(10)
+        card = QFrame(); card.setObjectName("Card")
+        inner = QVBoxLayout(card); inner.setContentsMargins(16, 14, 16, 14); inner.setSpacing(8)
+        ttl = QLabel(title); ttl.setStyleSheet("font-weight:700; font-size:15px;")
+        inner.addWidget(ttl)
+        for t in lines:
+            lab = QLabel(t); lab.setWordWrap(True); lab.setStyleSheet("color:#374151;")
+            inner.addWidget(lab)
+        root.addWidget(card)
+        btns = QHBoxLayout(); btns.addStretch()
+        ok = QPushButton(ok_text); ok.setProperty("type","primary"); ok.clicked.connect(self.accept)
+        btns.addWidget(ok); root.addLayout(btns)
 
 # ===== 이미지 비동기 로더 =====
 class ImageLoader(QThread):
@@ -60,7 +65,7 @@ class ImageLoader(QThread):
         except Exception as e:
             logger.exception(f"[IMG] 이미지 로드 실패: key={self.key}, url={self.url} :: {e}")
 
-# ===== 정렬 정확도를 위한 아이템 =====
+# ===== 정렬 정확도를 위한 아이템들 =====
 class NumericItem(QTableWidgetItem):
     def __init__(self, value):
         try: ival = int(str(value).replace(",", ""))
@@ -85,21 +90,6 @@ class DateItem(QTableWidgetItem):
             return self._key < other._key
         return super().__lt__(other)
 
-class PerfItem(QTableWidgetItem):
-    """표시 텍스트는 별(예: '⭐⭐⭐'), 비교는 내부 지표(float)로 수행"""
-    def __init__(self, stars: str, perf_val: float):
-        super().__init__(stars)
-        self._val = perf_val
-    def __lt__(self, other):
-        try:
-            a = self._val
-            b = other._val if isinstance(other, PerfItem) else float('nan')
-            if a != a: a = float("-inf")  # NaN은 가장 낮게
-            if b != b: b = float("-inf")
-            return a < b
-        except Exception:
-            return super().__lt__(other)
-
 class DurationItem(QTableWidgetItem):
     """표시는 'H:MM:SS' 또는 'M:SS', 비교는 초 단위 정수"""
     def __init__(self, seconds: int):
@@ -114,11 +104,11 @@ class DurationItem(QTableWidgetItem):
         except Exception:
             return super().__lt__(other)
 
-# ===== 필터 대화창 =====
+# ===== 필터 대화창 (추천도 UI 제거) =====
 class FilterDialog(QDialog):
     def __init__(self, parent=None, init: dict | None = None):
         super().__init__(parent)
-        self.setWindowTitle("필터/정렬 설정")
+        self.setWindowTitle("필터/정렬")
         self.setModal(True)
 
         self.form_combo = QComboBox()
@@ -129,43 +119,29 @@ class FilterDialog(QDialog):
         self.min_subs  = QLineEdit(); self.min_subs.setPlaceholderText("구독자 ≥ (예: 50k / 5만)")
         self.max_subs  = QLineEdit(); self.max_subs.setPlaceholderText("구독자 ≤ (빈칸=무제한)")
 
-        # 별점 체크박스(1~5 + N/A)
-        self.cb_star = {i: QCheckBox("⭐"*i) for i in range(1, 6)}
-        for cb in self.cb_star.values():
-            cb.setChecked(True)
-            cb.setToolTip("이 별점의 영상만 보기 포함/제외")
-        self.cb_star_na = QCheckBox("N/A 포함"); self.cb_star_na.setChecked(True)
-
         # 초기값 복원
         if init:
             self.form_combo.setCurrentIndex(init.get("form_idx", 0))
-            for w, k in ((self.min_views, "min_views_text"), (self.max_views, "max_views_text"),
-                         (self.min_subs, "min_subs_text"), (self.max_subs, "max_subs_text")):
+            for w, k in (
+                (self.min_views, "min_views_text"), (self.max_views, "max_views_text"),
+                (self.min_subs, "min_subs_text"),   (self.max_subs, "max_subs_text")
+            ):
                 if init.get(k): w.setText(init[k])
-            star_allow = set(init.get("star_allow", [1,2,3,4,5]))
-            for i in range(1,6):
-                self.cb_star[i].setChecked(i in star_allow)
-            self.cb_star_na.setChecked(bool(init.get("star_include_na", True)))
 
-        form = QFormLayout(self)
+        # 카드 UI
+        outer = QVBoxLayout(self); outer.setContentsMargins(12, 12, 12, 12); outer.setSpacing(10)
+        card = QFrame(); card.setObjectName("Card")
+        form = QFormLayout(card); form.setContentsMargins(16, 14, 16, 14)
         form.addRow("형식", self.form_combo)
         form.addRow("조회수 최소", self.min_views)
         form.addRow("조회수 최대", self.max_views)
         form.addRow("구독자 최소", self.min_subs)
         form.addRow("구독자 최대", self.max_subs)
-
-        # 별점 선택 가로 배치
-        star_row = QHBoxLayout()
-        for i in range(1,6):
-            star_row.addWidget(self.cb_star[i])
-        star_row.addWidget(self.cb_star_na)
-        star_row.addStretch(1)
-        form.addRow("별점", star_row)
+        outer.addWidget(card)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        outer.addWidget(btns)
 
         self.result = None
 
@@ -184,7 +160,6 @@ class FilterDialog(QDialog):
         return int(float(t))
 
     def accept(self):
-        star_allow = [i for i in range(1,6) if self.cb_star[i].isChecked()]
         self.result = {
             "form_idx": self.form_combo.currentIndex(),
             "min_views": self._parse_count(self.min_views.text()),
@@ -195,8 +170,6 @@ class FilterDialog(QDialog):
             "max_views_text": self.max_views.text(),
             "min_subs_text":  self.min_subs.text(),
             "max_subs_text":  self.max_subs.text(),
-            "star_allow": star_allow if star_allow else [1,2,3,4,5],  # 최소 1개 이상 유지
-            "star_include_na": self.cb_star_na.isChecked(),
         }
         super().accept()
 
@@ -223,10 +196,9 @@ class ApiKeyDialog(QDialog):
         btn_save = QPushButton("저장"); btn_save.setProperty("type", "primary"); btn_save.clicked.connect(self.on_save)
         btn_close = QPushButton("닫기"); btn_close.clicked.connect(self.reject)
 
-        # 카드 스타일 컨테이너
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self); outer.setContentsMargins(12, 12, 12, 12); outer.setSpacing(10)
         card = QFrame(); card.setObjectName("Card")
-        inner = QFormLayout(card)
+        inner = QFormLayout(card); inner.setContentsMargins(16, 14, 16, 14)
         inner.addRow("API 키", self.key_edit)
         inner.addRow("", self.show_chk)
         inner.addRow("검증 결과", self.status_label)
@@ -278,6 +250,7 @@ class ApiKeyDialog(QDialog):
 class SearchWorker(QThread):
     progress = Signal(int, int)  # (current, total)
     one = Signal(dict)
+    summary = Signal(int, int)   # (found, requested)  ← 부족 결과 안내
     done = Signal()
     error = Signal(str)
     def __init__(self, keyword: str, count: int):
@@ -287,8 +260,11 @@ class SearchWorker(QThread):
         try:
             logger.info(f"[UI-SEARCH] 시작: q='{self.keyword}', want={self.count}")
             ids = ytu.search_video_ids(self.keyword, self.count)
-            total = len(ids); self.progress.emit(0, total)
-            if total == 0: self.done.emit(); return
+            total = len(ids)
+            self.progress.emit(0, total)
+            self.summary.emit(total, self.count)  # 요약 전달
+            if total == 0:
+                self.done.emit(); return
             done_cnt = 0
             for info in ytu.iter_videos_info(ids):
                 if info: self.one.emit(info)
@@ -300,18 +276,18 @@ class SearchWorker(QThread):
 
 # ===== 메인 위젯 =====
 class YouTubeSearchWidget(QWidget):
-    # 컬럼 인덱스
+    # 컬럼 인덱스 (추천도/내부지수 제거로 재정의)
     COL_THUMB = 0
     COL_TITLE = 1
     COL_VIEWS = 2
-    COL_SUBS  = 3
-    COL_DATE  = 4
-    COL_DUR   = 5   # 새로 추가: 길이
-    COL_STARS = 6
-    COL_VURL  = 7
-    COL_FORM  = 8
-    COL_CH    = 9
-    COL_PERF  = 10  # 숨김: 내부지수(숫자)
+    COL_LIKES = 3
+    COL_COMMS = 4
+    COL_SUBS  = 5
+    COL_DATE  = 6
+    COL_DUR   = 7   # 길이
+    COL_VURL  = 8
+    COL_FORM  = 9
+    COL_CH    = 10
 
     THUMB_W     = 176
     TITLE_MIN_W = 420
@@ -330,84 +306,58 @@ class YouTubeSearchWidget(QWidget):
             "min_subs": None,  "max_subs": None,
             "min_views_text": "", "max_views_text": "",
             "min_subs_text":  "", "max_subs_text":  "",
-            "star_allow": [1,2,3,4,5],
-            "star_include_na": True,
         }
         self._seen_links: set[str] = set()
-
         self._build_ui()
         self.refresh_api_key_status()
-
-    # ----- 내부 지표/별점 변환 -----
-    @staticmethod
-    def _metric_score(views: int, subs: int) -> float:
-        if subs <= 0: return float('nan')
-        return (views / subs) * 14.285714
-
-    @staticmethod
-    def _metric_to_stars(val: float) -> str:
-        if val != val: return "N/A"  # NaN
-        if val < 12:   return "⭐"
-        if val < 16:   return "⭐⭐"
-        if val < 26:   return "⭐⭐⭐"
-        if val < 200:  return "⭐⭐⭐⭐"
-        return "⭐⭐⭐⭐⭐"
-
-    @staticmethod
-    def _metric_to_star_count(val: float) -> int:
-        if val != val: return 0  # N/A → 0
-        if val < 12:   return 1
-        if val < 16:   return 2
-        if val < 26:   return 3
-        if val < 200:  return 4
-        return 5
 
     # ----- UI 구성 -----
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(16, 16, 16, 16); main_layout.setSpacing(12)
 
-        # API 키 상태 카드
-        api_card = QFrame(); api_card.setObjectName("Card")
-        api_row = QHBoxLayout(api_card); api_row.setContentsMargins(12, 10, 12, 10)
+        # 상단 카드: API 상태 + 검색 컨트롤 (한 장으로 깔끔하게)
+        top_card = QFrame(); top_card.setObjectName("Card")
+        top_lay  = QHBoxLayout(top_card); top_lay.setContentsMargins(12, 10, 12, 10); top_lay.setSpacing(8)
+
         self.lbl_api = QLabel("API 키: 확인 중…")
         self.lbl_api.setStyleSheet("padding:6px 10px; border-radius:10px; background:#f1f5f9; color:#111;")
         self.btn_api = QPushButton("API 키 설정…"); self.btn_api.setProperty("type", "outline")
         self.btn_api.clicked.connect(self.open_api_dialog)
-        api_row.addWidget(QLabel("YouTube API")); api_row.addSpacing(6)
-        api_row.addWidget(self.lbl_api); api_row.addStretch(); api_row.addWidget(self.btn_api)
-        main_layout.addWidget(api_card)
 
-        # 검색 컨트롤 카드
-        ctrl_card = QFrame(); ctrl_card.setObjectName("Card")
-        top = QHBoxLayout(ctrl_card); top.setContentsMargins(12, 10, 12, 10); top.setSpacing(8)
+        # 우측: 키워드 / 개수 / 검색 / 필터 / 진행
         self.keyword_input = QLineEdit(); self.keyword_input.setPlaceholderText("키워드 입력")
-        self.count_input = QLineEdit();   self.count_input.setPlaceholderText("개수 (예: 50)")
+        self.count_input   = QLineEdit(); self.count_input.setPlaceholderText("개수 (예: 50)")
         self.search_button = QPushButton("검색"); self.search_button.setProperty("type", "primary")
         self.search_button.clicked.connect(self.on_search)
-        self.filter_btn = QPushButton("필터/정렬…"); self.filter_btn.setProperty("type", "outline")
+        self.filter_btn    = QPushButton("필터/정렬…"); self.filter_btn.setProperty("type", "outline")
         self.filter_btn.clicked.connect(self.open_filter_dialog)
         self.progress = QProgressBar(); self.progress.setVisible(False); self.progress.setFixedHeight(14)
         self.progress.setFormat("%p%  (%v/%m)"); self.progress.setRange(0, 100); self.progress.setValue(0)
 
-        top.addWidget(QLabel("키워드")); top.addWidget(self.keyword_input, 2)
-        top.addWidget(self.count_input, 0)
-        top.addWidget(self.search_button, 0)
-        top.addWidget(self.filter_btn, 0)
-        top.addWidget(self.progress, 1)
-        main_layout.addWidget(ctrl_card)
+        left = QHBoxLayout(); left.addWidget(QLabel("YouTube API")); left.addSpacing(6); left.addWidget(self.lbl_api); left.addWidget(self.btn_api)
+        left.addStretch()
+        right = QHBoxLayout()
+        right.addWidget(QLabel("키워드")); right.addWidget(self.keyword_input, 2)
+        right.addWidget(self.count_input, 0)
+        right.addWidget(self.search_button, 0)
+        right.addWidget(self.filter_btn, 0)
+        right.addWidget(self.progress, 1)
 
-        # 테이블
+        top_lay.addLayout(left, 3); top_lay.addLayout(right, 7)
+        main_layout.addWidget(top_card)
+
+        # 테이블 (열 개수 11)
         self.table = QTableWidget(0, 11)
         self.table.setObjectName("Card")
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
         self.table.setHorizontalHeaderLabels([
-            "썸네일", "제목", "조회수", "구독자수", "업로드 날짜", "길이", "별점",
-            "영상 링크", "형태", "채널명", "내부지수(숨김)"
+            "썸네일", "제목", "조회수", "좋아요수", "댓글수", "구독자수", "업로드 날짜", "길이",
+            "영상 링크", "형태", "채널명"
         ])
 
         h = self.table.horizontalHeader()
@@ -423,40 +373,41 @@ class YouTubeSearchWidget(QWidget):
         self.table.setColumnWidth(self.COL_TITLE, self.TITLE_MIN_W)
 
         h.setSectionResizeMode(self.COL_VIEWS, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(self.COL_LIKES, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(self.COL_COMMS, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(self.COL_SUBS,  QHeaderView.ResizeToContents)
         h.setSectionResizeMode(self.COL_DATE,  QHeaderView.ResizeToContents)
         h.setSectionResizeMode(self.COL_DUR,   QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(self.COL_STARS, QHeaderView.ResizeToContents)
 
         h.setSectionResizeMode(self.COL_VURL,  QHeaderView.Fixed); self.table.setColumnWidth(self.COL_VURL, 200)
         h.setSectionResizeMode(self.COL_FORM,  QHeaderView.Fixed); self.table.setColumnWidth(self.COL_FORM, 70)
         h.setSectionResizeMode(self.COL_CH,    QHeaderView.ResizeToContents)
 
-        self.table.setColumnHidden(self.COL_PERF, True)
         h.setMinimumSectionSize(60)
 
         self.table.setSortingEnabled(True)
         h.setSortIndicatorShown(True)
         h.sectionClicked.connect(self.on_header_clicked)
 
-        # 별점 헤더 툴팁(대중적 설명)
-        stars_hdr = self.table.horizontalHeaderItem(self.COL_STARS)
-        if stars_hdr: stars_hdr.setToolTip(STARS_PUBLIC_HELP)
-
         main_layout.addWidget(self.table)
 
-        # Export 카드
-        export_card = QFrame(); export_card.setObjectName("Card")
-        bottom = QHBoxLayout(export_card); bottom.setContentsMargins(12, 10, 12, 10)
-        bottom.addStretch()
+        # Export (심플 버튼만)
+        bottom = QHBoxLayout(); bottom.addStretch()
         self.export_html_btn = QPushButton("<HTML 저장>"); self.export_html_btn.setProperty("type", "outline")
         self.export_excel_btn = QPushButton("<엑셀 저장>"); self.export_excel_btn.setProperty("type", "outline")
         self.export_html_btn.clicked.connect(self.export_html)
         self.export_excel_btn.clicked.connect(self.export_excel)
         bottom.addWidget(self.export_html_btn); bottom.addWidget(self.export_excel_btn)
-        main_layout.addWidget(export_card)
+        main_layout.addLayout(bottom)
 
         self.table.cellClicked.connect(self.on_table_click)
+
+    def _update_license_ui(self):
+        """
+        ✅ 검색 버튼은 항상 활성화.
+        API 키 체크는 on_search()에서 처리합니다.
+        """
+        self.search_button.setEnabled(True)
 
     # ----- API 키 -----
     def _style_api_label(self, ok: bool):
@@ -474,11 +425,11 @@ class YouTubeSearchWidget(QWidget):
             masked = info.get("masked") or ""
             self._style_api_label(True)
             self.lbl_api.setToolTip(f"{masked}\n{loc}" if loc else masked)
-            self.search_button.setEnabled(True)
+            self._update_license_ui()
         else:
             self._style_api_label(False)
             self.lbl_api.setToolTip("상단의 [API 키 설정…] 버튼으로 등록하세요.")
-            self.search_button.setEnabled(False)
+            self._update_license_ui()
 
     def open_api_dialog(self):
         dlg = ApiKeyDialog(self)
@@ -487,25 +438,34 @@ class YouTubeSearchWidget(QWidget):
 
     # ----- 이벤트 -----
     def on_search(self):
+        # 1) API 키 체크
         if not ytu.peek_effective_key():
             QMessageBox.information(self, "API 키 필요", "YouTube API 키가 필요합니다. 키를 등록해 주세요.")
             self.open_api_dialog()
             if not ytu.peek_effective_key(): return
 
+        # 2) 입력값
         keyword = self.keyword_input.text().strip()
-        try: count = int(self.count_input.text().strip() or "50")
-        except ValueError: count = 50
+        try:
+            count = int(self.count_input.text().strip() or "50")
+        except ValueError:
+            count = 50
         if not keyword:
             QMessageBox.warning(self, "입력 확인", "키워드를 입력하세요."); return
 
         logger.info(f"[UI] 검색 버튼: q='{keyword}', count={count}")
 
+        # 기존 로더 종료
         for loader in self.image_loaders:
-            if loader.isRunning(): loader.terminate()
+            try:
+                if loader.isRunning(): loader.terminate()
+            except Exception:
+                pass
         self.image_loaders.clear()
 
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
+        with QSignalBlocker(self.table):
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(0)
         self.items_raw = []
         self._seen_links.clear()
         self._set_busy(True)
@@ -513,6 +473,7 @@ class YouTubeSearchWidget(QWidget):
 
         self.worker = SearchWorker(keyword, count)
         self.worker.progress.connect(self._on_progress)
+        self.worker.summary.connect(self._on_search_summary)   # 부족 결과 안내
         self.worker.one.connect(self._on_worker_one)
         self.worker.done.connect(self._on_worker_done)
         self.worker.error.connect(self._on_search_error)
@@ -522,6 +483,16 @@ class YouTubeSearchWidget(QWidget):
         if total <= 0: self.progress.setRange(0, 0); return
         if self.progress.maximum() != total: self.progress.setRange(0, total)
         self.progress.setValue(current)
+
+    def _on_search_summary(self, found: int, requested: int):
+        # 요청 대비 확보량이 부족하면 간결 안내
+        if found < requested:
+            msg = [
+                f"요청: {requested:,}개 / 실제: {found:,}개",
+                "이 키워드로 공개된 영상이 적거나, 유튜브가 더 보여줄 결과가 없어요.",
+                "tip) 키워드를 넓히거나 다른 표현을 시도해 보세요.",
+            ]
+            InfoDialog("결과가 적어요", msg, self).exec()
 
     def _on_worker_one(self, item: dict):
         vlink = item.get("video_link", "")
@@ -535,21 +506,29 @@ class YouTubeSearchWidget(QWidget):
     def _on_worker_done(self):
         if self.progress.maximum() > 0: self.progress.setValue(self.progress.maximum())
         QTimer.singleShot(500, lambda: self.progress.setVisible(False))
-        self._set_busy(False); self._restore_sorting()
+        self._set_busy(False)
+        self._restore_sorting()
 
     def _on_search_error(self, msg: str):
         logger.error(f"[UI] 수집 오류: {msg}")
         self.progress.setVisible(False)
-        self._set_busy(False); self.table.setSortingEnabled(True)
-        QMessageBox.critical(self, "수집 오류", msg)
+        self._set_busy(False)
+        with QSignalBlocker(self.table):
+            self.table.setSortingEnabled(True)
+        InfoDialog("수집 오류", [msg], self).exec()
 
     # ----- 필터 -----
     def open_filter_dialog(self):
-        dlg = FilterDialog(self, init=self.active_filter)
-        if dlg.exec() == QDialog.Accepted and dlg.result:
-            self.active_filter = dlg.result
-            items = [it for it in self.items_raw if self._filter_match(it, self.active_filter)]
-            self._render_rows(items); self._restore_sorting()
+        try:
+            dlg = FilterDialog(self, init=self.active_filter)
+            if dlg.exec() == QDialog.Accepted and dlg.result:
+                self.active_filter = dlg.result
+                items = [it for it in self.items_raw if self._filter_match(it, self.active_filter)]
+                self._render_rows(items)
+                self._restore_sorting()
+        except Exception as e:
+            logger.exception("필터 적용 중 예외")
+            InfoDialog("필터 적용 중 오류", [str(e)], self).exec()
 
     def _filter_match(self, it: dict, f: dict) -> bool:
         idx = f.get("form_idx", 0)
@@ -566,45 +545,46 @@ class YouTubeSearchWidget(QWidget):
         if mins is not None and s < mins: return False
         if maxs is not None and s > maxs: return False
 
-        # 별점 필터
-        perf = self._metric_score(v, s)
-        star_cnt = self._metric_to_star_count(perf)  # 0=NA
-        allow = set(f.get("star_allow", [1,2,3,4,5]))
-        include_na = bool(f.get("star_include_na", True))
-        if star_cnt == 0:
-            return include_na
-        return star_cnt in allow
+        return True
 
     def on_header_clicked(self, col: int):
-        numeric_desc_default = {self.COL_VIEWS, self.COL_SUBS, self.COL_STARS, self.COL_PERF, self.COL_DUR}
+        numeric_desc_default = {self.COL_VIEWS, self.COL_LIKES, self.COL_COMMS, self.COL_SUBS, self.COL_DUR}
         if self._last_sort_col == col:
             self._last_sort_order = Qt.DescendingOrder if self._last_sort_order == Qt.AscendingOrder else Qt.AscendingOrder
         else:
             self._last_sort_col = col
             self._last_sort_order = Qt.DescendingOrder if col in numeric_desc_default else Qt.AscendingOrder
-        self.table.sortItems(col, self._last_sort_order)
-        self.table.horizontalHeader().setSortIndicator(col, self._last_sort_order)
+        try:
+            self.table.sortItems(col, self._last_sort_order)
+            self.table.horizontalHeader().setSortIndicator(col, self._last_sort_order)
+        except Exception:
+            pass
 
     # ----- 렌더 -----
     def _render_rows(self, items: list[dict]):
         for loader in self.image_loaders:
-            if loader.isRunning(): loader.terminate()
+            try:
+                if loader.isRunning(): loader.terminate()
+            except Exception:
+                pass
         self.image_loaders.clear()
 
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
+        with QSignalBlocker(self.table):
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(0)
 
-        temp_seen: set[str] = set()
-        for it in items:
-            vlink = it.get("video_link", "")
-            if vlink and vlink in temp_seen: continue
-            if vlink: temp_seen.add(vlink)
-            self._insert_row(it)
+            temp_seen: set[str] = set()
+            for it in items:
+                vlink = it.get("video_link", "")
+                if vlink and vlink in temp_seen: continue
+                if vlink: temp_seen.add(vlink)
+                self._insert_row(it)
 
         self._ensure_title_min()
 
     def _insert_row(self, item: dict):
-        row = self.table.rowCount(); self.table.insertRow(row)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
         self.table.setRowHeight(row, 116)
 
         # 0 썸네일
@@ -620,27 +600,26 @@ class YouTubeSearchWidget(QWidget):
         views = int(item.get("views", 0) or 0)
         self.table.setItem(row, self.COL_VIEWS, NumericItem(views))
 
-        # 3 구독자수
+        # 3 좋아요수
+        likes = int(item.get("likes", 0) or 0)
+        self.table.setItem(row, self.COL_LIKES, NumericItem(likes))
+
+        # 4 댓글수
+        comms = int(item.get("comments", 0) or 0)
+        self.table.setItem(row, self.COL_COMMS, NumericItem(comms))
+
+        # 5 구독자수
         subs = int(item.get("subscribers", 0) or 0)
         self.table.setItem(row, self.COL_SUBS, NumericItem(subs))
 
-        # 4 업로드 날짜
+        # 6 업로드 날짜
         self.table.setItem(row, self.COL_DATE, DateItem(item.get("upload_date", "")))
 
-        # 5 길이(초→포맷), 정렬은 초 기준
+        # 7 길이(초→포맷), 정렬은 초 기준
         dur_sec = int(item.get("duration_sec", 0) or 0)
         self.table.setItem(row, self.COL_DUR, DurationItem(dur_sec))
 
-        # 6 별점 (지표 기반)
-        perf = self._metric_score(views, subs)
-        stars = self._metric_to_stars(perf)
-        stars_item = PerfItem(stars, perf)
-        stars_item.setToolTip(
-            STARS_PUBLIC_HELP + ("\n\n(이 영상은 별점 N/A)" if perf != perf else "\n\n이 별점은 채널 규모 대비 반응을 간단히 표현합니다.")
-        )
-        self.table.setItem(row, self.COL_STARS, stars_item)
-
-        # 7 영상 링크
+        # 8 영상 링크
         vlink = item.get("video_link", "")
         v_item = QTableWidgetItem(vlink)
         v_item.setData(Qt.UserRole, vlink)
@@ -648,16 +627,12 @@ class YouTubeSearchWidget(QWidget):
         v_item.setToolTip("클릭하여 영상 열기")
         self.table.setItem(row, self.COL_VURL, v_item)
 
-        # 8 형태
+        # 9 형태
         form_txt = item.get("form", "") or ("숏폼" if item.get("is_shorts") else "롱폼")
         self.table.setItem(row, self.COL_FORM, QTableWidgetItem(form_txt))
 
-        # 9 채널명
+        # 10 채널명
         self.table.setItem(row, self.COL_CH, QTableWidgetItem(item.get("channel", "")))
-
-        # 10 내부지수(숨김)
-        perf_txt = "" if perf != perf else f"{perf:.2f}"
-        self.table.setItem(row, self.COL_PERF, QTableWidgetItem(perf_txt))
 
         # 썸네일 비동기 로딩
         loader = ImageLoader(vlink, item.get("thumbnail", ""))
@@ -696,7 +671,6 @@ class YouTubeSearchWidget(QWidget):
             lab.setPixmap(pixmap); lab.setText(""); lab.setScaledContents(True)
 
     def _set_busy(self, busy: bool):
-        self.search_button.setEnabled(not busy and bool(ytu.peek_effective_key()))
         self.keyword_input.setEnabled(not busy)
         self.count_input.setEnabled(not busy)
         self.filter_btn.setEnabled(not busy)
@@ -729,16 +703,26 @@ class YouTubeSearchWidget(QWidget):
             if subs >= 1_000_000: subs_item.setBackground(QColor(255, 48, 48, 34))
             elif subs >= 100_000: subs_item.setBackground(QColor(255, 48, 48, 18))
 
+    def _restore_sorting(self):
+        try:
+            self.table.setSortingEnabled(True)
+            if self._last_sort_col is not None:
+                self.table.sortItems(self._last_sort_col, self._last_sort_order)
+                self.table.horizontalHeader().setSortIndicator(self._last_sort_col, self._last_sort_order)
+        except Exception:
+            pass
+
     def _collect_rows(self):
         rows = []
         for r in range(self.table.rowCount()):
             rows.append({
                 "title": self.table.item(r, self.COL_TITLE).text() if self.table.item(r, self.COL_TITLE) else "",
                 "views": self.table.item(r, self.COL_VIEWS).text() if self.table.item(r, self.COL_VIEWS) else "",
+                "likes": self.table.item(r, self.COL_LIKES).text() if self.table.item(r, self.COL_LIKES) else "",
+                "comments": self.table.item(r, self.COL_COMMS).text() if self.table.item(r, self.COL_COMMS) else "",
                 "subscribers": self.table.item(r, self.COL_SUBS).text() if self.table.item(r, self.COL_SUBS) else "",
                 "upload_date": self.table.item(r, self.COL_DATE).text() if self.table.item(r, self.COL_DATE) else "",
                 "duration": self.table.item(r, self.COL_DUR).text() if self.table.item(r, self.COL_DUR) else "",
-                "stars": self.table.item(r, self.COL_STARS).text() if self.table.item(r, self.COL_STARS) else "",
                 "video_link": self.table.item(r, self.COL_VURL).text() if self.table.item(r, self.COL_VURL) else "",
                 "form": self.table.item(r, self.COL_FORM).text() if self.table.item(r, self.COL_FORM) else "",
                 "channel": self.table.item(r, self.COL_CH).text() if self.table.item(r, self.COL_CH) else "",
@@ -749,7 +733,7 @@ class YouTubeSearchWidget(QWidget):
     def export_excel(self):
         rows = self._collect_rows()
         if not rows:
-            QMessageBox.information(self, "알림", "저장할 데이터가 없습니다."); return
+            InfoDialog("안내", ["저장할 데이터가 없습니다."], self).exec(); return
         path, _ = QFileDialog.getSaveFileName(self, "엑셀 저장", "youtube_results.xlsx", "Excel 파일 (*.xlsx)")
         if not path: return
 
@@ -760,7 +744,7 @@ class YouTubeSearchWidget(QWidget):
             fmt_text = workbook.add_format({'text_wrap': False, 'valign': 'top'})
             fmt_number = workbook.add_format({'num_format': '0', 'valign': 'top'})
 
-            headers = ["title","views","subscribers","upload_date","duration","stars","video_link","form","channel"]
+            headers = ["title","views","likes","comments","subscribers","upload_date","duration","video_link","form","channel"]
             for ci, h in enumerate(headers):
                 worksheet.write(0, ci, h, fmt_text)
                 if h in ("title",):
@@ -790,47 +774,49 @@ class YouTubeSearchWidget(QWidget):
                 worksheet.set_row(ri, FIXED_HEIGHT)
                 worksheet.write(ri, 0, r.get("title", "") or "", fmt_text)
 
-                v = _to_int_safe(r.get("views", ""))
-                worksheet.write_number(ri, 1, v, fmt_number) if v is not None else worksheet.write(ri, 1, "", fmt_text)
+                v  = _to_int_safe(r.get("views", ""));       worksheet.write_number(ri, 1, v,  fmt_number) if v  is not None else worksheet.write(ri, 1,  "", fmt_text)
+                lk = _to_int_safe(r.get("likes", ""));       worksheet.write_number(ri, 2, lk, fmt_number) if lk is not None else worksheet.write(ri, 2, "", fmt_text)
+                cm = _to_int_safe(r.get("comments", ""));    worksheet.write_number(ri, 3, cm, fmt_number) if cm is not None else worksheet.write(ri, 3, "", fmt_text)
+                s  = _to_int_safe(r.get("subscribers", "")); worksheet.write_number(ri, 4, s,  fmt_number) if s  is not None else worksheet.write(ri, 4, "", fmt_text)
 
-                s = _to_int_safe(r.get("subscribers", ""))
-                worksheet.write_number(ri, 2, s, fmt_number) if s is not None else worksheet.write(ri, 2, "", fmt_text)
-
-                worksheet.write(ri, 3, r.get("upload_date", "") or "", fmt_text)
-                worksheet.write(ri, 4, r.get("duration", "") or "", fmt_text)
-                worksheet.write(ri, 5, r.get("stars", "") or "", fmt_text)
-                worksheet.write(ri, 6, r.get("video_link", "") or "", fmt_text)
-                worksheet.write(ri, 7, r.get("form", "") or "", fmt_text)
-                worksheet.write(ri, 8, r.get("channel", "") or "", fmt_text)
+                worksheet.write(ri, 5, r.get("upload_date", "") or "", fmt_text)
+                worksheet.write(ri, 6, r.get("duration", "") or "", fmt_text)
+                worksheet.write(ri, 7, r.get("video_link", "") or "", fmt_text)
+                worksheet.write(ri, 8, r.get("form", "") or "", fmt_text)
+                worksheet.write(ri, 9, r.get("channel", "") or "", fmt_text)
 
             workbook.close()
-            QMessageBox.information(self, "완료", f"엑셀 저장 완료\n{path}")
+            InfoDialog("완료", [f"엑셀 저장 완료\n{path}"], self).exec()
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"엑셀 저장 실패(xlsxwriter): {e}")
+            InfoDialog("오류", [f"엑셀 저장 실패(xlsxwriter): {e}"], self).exec()
 
     def export_html(self):
         rows = self._collect_rows()
         if not rows:
-            QMessageBox.information(self, "알림", "저장할 데이터가 없습니다."); return
+            InfoDialog("안내", ["저장할 데이터가 없습니다."], self).exec(); return
         path, _ = QFileDialog.getSaveFileName(self, "HTML 저장", "youtube_results.html", "HTML 파일 (*.html)")
         if not path: return
         html = ["<html><head><meta charset='utf-8'></head><body><table border='1' cellspacing='0' cellpadding='6'>"]
-        html.append("<tr><th>제목</th><th>조회수</th><th>구독자수</th><th>업로드</th><th>길이</th><th>별점</th><th>영상 링크</th><th>형태</th><th>채널</th></tr>")
+        html.append("<tr><th>제목</th><th>조회수</th><th>좋아요수</th><th>댓글수</th><th>구독자수</th><th>업로드</th><th>길이</th><th>영상 링크</th><th>형태</th><th>채널</th></tr>")
         for r in rows:
             html.append(
                 f"<tr>"
                 f"<td>{r['title']}</td>"
                 f"<td>{r['views']}</td>"
+                f"<td>{r['likes']}</td>"
+                f"<td>{r['comments']}</td>"
                 f"<td>{r['subscribers']}</td>"
                 f"<td>{r['upload_date']}</td>"
                 f"<td>{r['duration']}</td>"
-                f"<td>{r['stars']}</td>"
                 f"<td><a href='{r['video_link']}'>{r['video_link']}</a></td>"
                 f"<td>{r['form']}</td>"
                 f"<td>{r['channel']}</td>"
                 f"</tr>"
             )
         html.append("</table></body></html>")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(html))
-        QMessageBox.information(self, "완료", f"HTML 저장 완료\n{path}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(html))
+            InfoDialog("완료", [f"HTML 저장 완료\n{path}"], self).exec()
+        except Exception as e:
+            InfoDialog("오류", [f"HTML 저장 실패: {e}"], self).exec()
